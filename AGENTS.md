@@ -23,9 +23,10 @@ This repository contains the portable `memroute` CLI and the `agent-workspace-in
 ## Change and Verification Workflow
 
 1. For behavior changes, update or add focused unit tests in `src/main.rs`.
-2. Run `cargo fmt --check` and `cargo test` from this repository.
-3. Before committing, scan tracked content for machine paths and sensitive data.
-4. Do not commit build output, `.memroute/`, or a caller's collection configuration and knowledge files.
+2. Follow the repository-owned `rustfmt.toml`; run `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets -- -D warnings` from this repository.
+3. Treat warnings as errors. The `Cargo.toml` `[lints]` table enables Clippy `all`, `pedantic`, `nursery`, and `cargo` lint groups; new suppressions require a short local justification. `cargo_common_metadata` remains temporarily allowed only until the repository owner sets the public `package.repository` URL.
+4. Before committing, scan tracked content for machine paths and sensitive data.
+5. Do not commit build output, `.memroute/`, or a caller's collection configuration and knowledge files.
 
 ## Skill Maintenance
 

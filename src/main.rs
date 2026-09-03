@@ -61,7 +61,7 @@ enum Command {
     Impact(ImpactArgs),
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Copy, Debug)]
 struct IndexArgs {
     /// Rebuild even when source hashes match the last manifest.
     #[arg(long)]
@@ -136,7 +136,7 @@ struct RouteArgs {
     json: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Copy, Debug)]
 struct AuditArgs {
     /// Produce JSON for agents and other callers.
     #[arg(long)]
@@ -178,7 +178,7 @@ enum KindArg {
 }
 
 impl KindArg {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Route => "route",
             Self::StableFact => "stable_fact",
@@ -197,7 +197,7 @@ enum Risk {
 }
 
 impl Risk {
-    fn is_high(self) -> bool {
+    const fn is_high(self) -> bool {
         matches!(self, Self::High)
     }
 }
@@ -641,20 +641,9 @@ fn route_command(root: &Path, config: &Config, args: RouteArgs) -> Result<()> {
         bail!("route --limit must be between 3 and 8");
     }
     ensure_index(root, config)?;
-    require_workspace(config, &args.workspace)?;
-    for workspace in &args.include_workspaces {
-        require_workspace(config, workspace)?;
-    }
-
+    let scopes = route_scopes(config, &args)?;
     let index = open_index(root, config)?;
     let fields = Fields::from_schema(&index.schema())?;
-    let mut scopes = vec![args.workspace.clone()];
-    for workspace in &args.include_workspaces {
-        if !scopes.contains(workspace) {
-            scopes.push(workspace.clone());
-        }
-    }
-
     let combined_query = build_route_query(&args);
     let route_matches = search_scoped(
         &index,
@@ -666,12 +655,10 @@ fn route_command(root: &Path, config: &Config, args: RouteArgs) -> Result<()> {
         None,
         MAX_TOPICS,
     )?;
-
     let preferred_paths = route_matches
         .iter()
         .flat_map(|result| extract_markdown_paths_from_source(root, config, result))
         .collect::<HashSet<_>>();
-
     let candidates = search_scoped(
         &index,
         &fields,
@@ -686,7 +673,6 @@ fn route_command(root: &Path, config: &Config, args: RouteArgs) -> Result<()> {
         None,
         args.limit.saturating_mul(8),
     )?;
-
     let l2_context =
         rank_route_candidates(candidates, &preferred_paths, &args.workspace, args.limit);
     let l3_authorities = if args.risk.is_high() {
@@ -701,7 +687,43 @@ fn route_command(root: &Path, config: &Config, args: RouteArgs) -> Result<()> {
     } else {
         Vec::new()
     };
+    let notes = route_notes(&args, &scopes, &l3_authorities);
 
+    let output = RouteOutput {
+        task: TaskProfile {
+            workspace: args.workspace,
+            query: args.query,
+            intent: args.intent,
+            entities: args.entities,
+            environment: args.environment,
+            risk: format!("{:?}", args.risk).to_lowercase(),
+            scopes,
+        },
+        route_matches,
+        l2_context,
+        l3_authorities,
+        notes,
+    };
+    print_output(&output, args.json)
+}
+
+fn route_scopes(config: &Config, args: &RouteArgs) -> Result<Vec<String>> {
+    require_workspace(config, &args.workspace)?;
+    let mut scopes = vec![args.workspace.clone()];
+    for workspace in &args.include_workspaces {
+        require_workspace(config, workspace)?;
+        if !scopes.contains(workspace) {
+            scopes.push(workspace.clone());
+        }
+    }
+    Ok(scopes)
+}
+
+fn route_notes(
+    args: &RouteArgs,
+    scopes: &[String],
+    l3_authorities: &[SearchResult],
+) -> Vec<String> {
     let mut notes = vec![
         "MemRoute returns routing evidence only. Read the cited source section before treating a result as fact."
             .to_owned(),
@@ -728,23 +750,7 @@ fn route_command(root: &Path, config: &Config, args: RouteArgs) -> Result<()> {
             scopes.join(", ")
         ));
     }
-
-    let output = RouteOutput {
-        task: TaskProfile {
-            workspace: args.workspace,
-            query: args.query,
-            intent: args.intent,
-            entities: args.entities,
-            environment: args.environment,
-            risk: format!("{:?}", args.risk).to_lowercase(),
-            scopes,
-        },
-        route_matches,
-        l2_context,
-        l3_authorities,
-        notes,
-    };
-    print_output(&output, args.json)
+    notes
 }
 
 fn audit_command(root: &Path, config: &Config, args: AuditArgs) -> Result<()> {
@@ -1233,15 +1239,15 @@ fn parse_markdown_chunks(
     let lines = content.lines().collect::<Vec<_>>();
     let headings = markdown_headings(&lines);
     let metadata = parse_metadata(&content);
-    let title = headings
-        .first()
-        .map(|heading| heading.title.clone())
-        .unwrap_or_else(|| {
+    let title = headings.first().map_or_else(
+        || {
             path.file_stem()
                 .and_then(|name| name.to_str())
                 .unwrap_or("untitled")
                 .to_owned()
-        });
+        },
+        |heading| heading.title.clone(),
+    );
 
     let mut chunks = Vec::new();
     if headings.is_empty() {
@@ -1265,8 +1271,9 @@ fn parse_markdown_chunks(
     for (index, heading) in headings.iter().enumerate() {
         let next = headings.get(index + 1);
         let line_end = next
-            .map(|next_heading| next_heading.line.saturating_sub(1))
-            .unwrap_or(lines.len())
+            .map_or(lines.len(), |next_heading| {
+                next_heading.line.saturating_sub(1)
+            })
             .max(heading.line);
         let body = lines[heading.line - 1..line_end].join("\n");
         if body.trim().is_empty() {
@@ -1658,7 +1665,7 @@ fn search_scoped(
         kinds,
         entities,
         environment,
-    )?;
+    );
     execute_search(&reader, fields, query.as_ref(), limit)
 }
 
@@ -1670,7 +1677,7 @@ fn build_query(
     kinds: &[String],
     entities: &[String],
     environment: Option<&str>,
-) -> Result<Box<dyn Query>> {
+) -> Box<dyn Query> {
     let parser = QueryParser::for_index(index, fields.searchable());
     let mut should_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     for term in query_terms(query_text) {
@@ -1708,7 +1715,7 @@ fn build_query(
             text_all_query(fields.environment, &[environment.to_owned()]),
         ));
     }
-    Ok(Box::new(BooleanQuery::from(clauses)))
+    Box::new(BooleanQuery::from(clauses))
 }
 
 fn exact_any_query(field: Field, values: &[String]) -> Box<dyn Query> {
@@ -1857,7 +1864,7 @@ fn build_route_query(args: &RouteArgs) -> String {
     let generic_entities = args
         .entities
         .iter()
-        .flat_map(|entity| entity.rsplit_once('-').map(|(prefix, _)| prefix.to_owned()))
+        .filter_map(|entity| entity.rsplit_once('-').map(|(prefix, _)| prefix.to_owned()))
         .collect::<Vec<_>>()
         .join(" ");
     [
@@ -1946,8 +1953,10 @@ fn extract_markdown_paths_from_source(
         return Vec::new();
     };
     let lines = content.lines().collect::<Vec<_>>();
-    let start = result.line_start.saturating_sub(1) as usize;
-    let end = (result.line_end as usize).min(lines.len());
+    let start = usize::try_from(result.line_start.saturating_sub(1)).unwrap_or(lines.len());
+    let end = usize::try_from(result.line_end)
+        .unwrap_or(lines.len())
+        .min(lines.len());
     if start >= end {
         return Vec::new();
     }
@@ -2115,10 +2124,10 @@ fn is_promotion_candidate(chunk: &Chunk) -> bool {
 }
 
 fn promotion_reason(chunk: &Chunk) -> String {
-    if !chunk.source_urls.is_empty() {
-        "section contains confirmed/standard language and an external source reference; review whether it is reusable beyond this task".to_owned()
-    } else {
+    if chunk.source_urls.is_empty() {
         "section contains confirmed/standard language and enough task detail to review; add or verify an authority before promotion".to_owned()
+    } else {
+        "section contains confirmed/standard language and an external source reference; review whether it is reusable beyond this task".to_owned()
     }
 }
 
