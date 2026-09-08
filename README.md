@@ -58,17 +58,17 @@ export MEMROUTE_REPOSITORY="$PWD/memroute"
 export COLLECTION_ROOT=/path/to/your/collection
 ```
 
-Create the collection configuration shown in [Configuration](#configuration), then build the local index:
+Install the CLI once, then use the `memroute` binary for normal retrieval:
 
 ```bash
-cargo run --manifest-path "$MEMROUTE_REPOSITORY/Cargo.toml" -- --root "$COLLECTION_ROOT" index
+cargo install --path "$MEMROUTE_REPOSITORY"
+memroute --root "$COLLECTION_ROOT" index
 ```
 
 Route a task to a small L2 context plan:
 
 ```bash
-cargo run --manifest-path "$MEMROUTE_REPOSITORY/Cargo.toml" -- \
-  --root "$COLLECTION_ROOT" \
+memroute --root "$COLLECTION_ROOT" \
   route "investigate API timeout" \
   --workspace platform \
   --intent investigate \
@@ -82,16 +82,17 @@ If the shell's current directory is the collection root, `--root` is optional:
 
 ```bash
 cd "$COLLECTION_ROOT"
-cargo run --manifest-path "$MEMROUTE_REPOSITORY/Cargo.toml" -- index
+memroute index
 ```
 
-To install the CLI locally instead of using `cargo run`:
+Use the checked-out source only to install or upgrade the binary, or to develop, debug, or validate source changes before installation:
 
 ```bash
-cd "$MEMROUTE_REPOSITORY"
-cargo install --path .
-memroute --root "$COLLECTION_ROOT" index
+cargo run --manifest-path "$MEMROUTE_REPOSITORY/Cargo.toml" -- --root "$COLLECTION_ROOT" index
+cargo install --path "$MEMROUTE_REPOSITORY" --force
 ```
+
+Do not manually load, copy, or commit the repository's `target/` directory; Cargo manages it as local build cache.
 
 ## Collection layout
 
@@ -174,6 +175,7 @@ All commands accept `--root <collection-root>`. JSON output is intended for agen
 | `audit` | Find broken knowledge-navigation references, unrouted memory files, and collection-size warnings. |
 | `review --workspace <name> --task <task-name>` | Suggest reusable conclusions from a task record; it never edits knowledge files. |
 | `impact <path>` | Show indexed chunks and likely navigation entries affected by a source path. |
+| `analyze [--workspace <name>]` | Summarize command durations, route coverage, candidate counts, feedback outcomes, and an effectiveness conclusion from the local event log. |
 
 ### Index
 
@@ -215,7 +217,7 @@ memroute --root "$COLLECTION_ROOT" \
 
 For `--risk high`, MemRoute returns `l3_authorities` in addition to `route_matches` and `l2_context`. Before acting, open the cited original systems and verify current state, permissions, and change requirements.
 
-### Audit, review, and impact
+### Audit, review, impact, and analyze
 
 ```bash
 memroute --root "$COLLECTION_ROOT" audit --json
@@ -225,7 +227,12 @@ memroute --root "$COLLECTION_ROOT" \
 
 memroute --root "$COLLECTION_ROOT" \
   impact platform/memory/api-operations.md --json
+
+memroute --root "$COLLECTION_ROOT" analyze --json
+memroute --root "$COLLECTION_ROOT" analyze --workspace platform --json
 ```
+
+`analyze` reads the local event log only and emits `data_quality`, `metrics`, and `conclusion`. Focus on `data_quality.malformed_line_count`, `feedback_route_coverage_percent`, `used_candidate_rate_among_judged_percent`, and `conclusion`. When the conclusion is `insufficient_data`, `early_signal`, `insufficient_discrimination`, or `needs_attention`, keep recording `background`, `rejected`, or `needs-l3` feedback and fix log integrity or high-risk L3 coverage before treating the result as effective.
 
 ## Agent Skill
 

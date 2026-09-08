@@ -1,12 +1,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs,
+    io::Write,
     path::{Component, Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use fs2::FileExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,8 +30,10 @@ use walkdir::WalkDir;
 const CONFIG_FILE: &str = "memroute.toml";
 const INDEX_DIR: &str = ".memroute/index";
 const MANIFEST_PATH: &str = ".memroute/manifest.json";
-const INDEX_VERSION: u32 = 4;
+const EVENT_LOG_PATH: &str = ".memroute/events.jsonl";
+const INDEX_VERSION: u32 = 5;
 const MAX_TOPICS: usize = 16;
+static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,6 +45,14 @@ struct Cli {
     /// Workspace collection root containing memroute.toml and named workspaces.
     #[arg(long, global = true)]
     root: Option<PathBuf>,
+
+    /// Local JSONL event log. Relative paths are resolved from the collection root.
+    #[arg(long, global = true, conflicts_with = "no_event_log")]
+    event_log: Option<PathBuf>,
+
+    /// Do not write local event logs. Feedback is unavailable when disabled.
+    #[arg(long, global = true)]
+    no_event_log: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -59,6 +72,10 @@ enum Command {
     Review(ReviewArgs),
     /// Show index documents affected by a source path.
     Impact(ImpactArgs),
+    /// Record how an agent or caller used the candidates from a prior route request.
+    Feedback(FeedbackArgs),
+    /// Analyze local execution records and report retrieval effectiveness metrics.
+    Analyze(AnalyzeArgs),
 }
 
 #[derive(Args, Clone, Copy, Debug)]
@@ -131,6 +148,10 @@ struct RouteArgs {
     #[arg(long, default_value_t = 6)]
     limit: usize,
 
+    /// Opaque, non-sensitive identifier used only to group local route metrics.
+    #[arg(long)]
+    task_id: Option<String>,
+
     /// Produce JSON for agents and other callers.
     #[arg(long)]
     json: bool,
@@ -166,6 +187,62 @@ struct ImpactArgs {
     /// Produce JSON for agents and other callers.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args, Debug)]
+struct FeedbackArgs {
+    /// Identifier returned by a prior `route` invocation.
+    #[arg(long)]
+    request_id: String,
+
+    /// Opaque chunk identifier returned in `l2_context` or `l3_authorities`. Repeat as needed.
+    #[arg(long = "chunk-id")]
+    chunk_ids: Vec<String>,
+
+    /// How the caller used the routed candidates.
+    #[arg(long, value_enum)]
+    outcome: FeedbackOutcome,
+
+    /// Produce JSON for agents and other callers.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Clone, Debug)]
+struct AnalyzeArgs {
+    /// Limit metrics to one workspace declared in memroute.toml.
+    #[arg(long)]
+    workspace: Option<String>,
+
+    /// Produce JSON for agents and other callers.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum FeedbackOutcome {
+    Used,
+    Background,
+    Rejected,
+    NeedsL3,
+    Blocked,
+}
+
+impl FeedbackOutcome {
+    const fn requires_chunks(self) -> bool {
+        !matches!(self, Self::Blocked)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Used => "used",
+            Self::Background => "background",
+            Self::Rejected => "rejected",
+            Self::NeedsL3 => "needs_l3",
+            Self::Blocked => "blocked",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -235,6 +312,76 @@ struct Manifest {
     index_version: u32,
     indexed_at_epoch_secs: u64,
     sources: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+struct EventLog {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CommandInvocationEvent {
+    schema_version: u8,
+    event_type: String,
+    timestamp_epoch_millis: u64,
+    command: String,
+    duration_millis: u64,
+    index_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_count: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RouteInvocationEvent {
+    schema_version: u8,
+    event_type: String,
+    timestamp_epoch_millis: u64,
+    request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    workspace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intent_fingerprint: Option<String>,
+    risk: String,
+    scopes: Vec<String>,
+    duration_millis: u64,
+    index_fingerprint: String,
+    l2_context: Vec<EventCandidate>,
+    l3_authorities: Vec<EventCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EventCandidate {
+    chunk_id: String,
+    rank: usize,
+    kind: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FeedbackEvent {
+    schema_version: u8,
+    event_type: String,
+    timestamp_epoch_millis: u64,
+    request_id: String,
+    outcome: FeedbackOutcome,
+    chunk_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+enum LoggedEvent {
+    CommandInvoked(CommandInvocationEvent),
+    RouteInvoked(RouteInvocationEvent),
+    RouteFeedback(FeedbackEvent),
+}
+
+#[derive(Debug)]
+struct ParsedEventLog {
+    events: Vec<LoggedEvent>,
+    physical_line_count: usize,
+    concatenated_event_lines: usize,
+    malformed_line_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -389,6 +536,7 @@ impl Fields {
 #[derive(Debug, Clone, Serialize)]
 struct SearchResult {
     score: f32,
+    chunk_id: String,
     workspace: String,
     kind: String,
     path: String,
@@ -413,6 +561,8 @@ struct SearchOutput {
 
 #[derive(Debug, Serialize)]
 struct RouteOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
     task: TaskProfile,
     route_matches: Vec<SearchResult>,
     l2_context: Vec<SearchResult>,
@@ -424,6 +574,8 @@ struct RouteOutput {
 struct TaskProfile {
     workspace: String,
     query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
     intent: Option<String>,
     entities: Vec<String>,
     environment: Option<String>,
@@ -479,18 +631,87 @@ struct ImpactOutput {
     notes: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct FeedbackOutput {
+    request_id: String,
+    outcome: FeedbackOutcome,
+    accepted_chunk_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalysisOutput {
+    data_quality: AnalysisDataQuality,
+    metrics: AnalysisMetrics,
+    conclusion: EffectivenessConclusion,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalysisDataQuality {
+    event_count: usize,
+    physical_line_count: usize,
+    concatenated_event_lines: usize,
+    malformed_line_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalysisMetrics {
+    command_invocations: BTreeMap<String, usize>,
+    command_duration_millis: BTreeMap<String, DurationSummary>,
+    route_count: usize,
+    routes_by_workspace: BTreeMap<String, usize>,
+    routes_by_risk: BTreeMap<String, usize>,
+    routes_with_l2_context: usize,
+    l2_route_coverage_percent: Option<f64>,
+    route_duration_millis: Option<DurationSummary>,
+    high_risk_route_count: usize,
+    high_risk_routes_with_l3: usize,
+    high_risk_l3_coverage_percent: Option<f64>,
+    l2_candidate_count: usize,
+    l3_candidate_count: usize,
+    routes_with_feedback: usize,
+    routes_without_feedback: usize,
+    feedback_route_coverage_percent: Option<f64>,
+    feedback_event_count: usize,
+    feedback_chunk_count: usize,
+    judged_candidate_count: usize,
+    used_candidate_count: usize,
+    used_candidate_rate_among_judged_percent: Option<f64>,
+    feedback_outcomes: BTreeMap<String, usize>,
+    used_candidates_by_kind: BTreeMap<String, usize>,
+    orphan_feedback_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct DurationSummary {
+    count: usize,
+    min: u64,
+    max: u64,
+    average: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct EffectivenessConclusion {
+    status: String,
+    confidence: String,
+    findings: Vec<String>,
+    recommendations: Vec<String>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let root = canonical_or_original(cli.root.unwrap_or(std::env::current_dir()?))?;
+    let root = canonical_or_original(cli.root.clone().unwrap_or(std::env::current_dir()?))?;
     let config = load_config(&root)?;
+    let event_log = event_log_for_cli(&root, &cli);
 
     match cli.command {
-        Command::Index(args) => index_command(&root, &config, args),
-        Command::Search(args) => search_command(&root, &config, args),
-        Command::Route(args) => route_command(&root, &config, args),
-        Command::Audit(args) => audit_command(&root, &config, args),
-        Command::Review(args) => review_command(&root, &config, args),
-        Command::Impact(args) => impact_command(&root, &config, args),
+        Command::Index(args) => index_command(&root, &config, args, event_log.as_ref()),
+        Command::Search(args) => search_command(&root, &config, args, event_log.as_ref()),
+        Command::Route(args) => route_command(&root, &config, args, event_log.as_ref()),
+        Command::Audit(args) => audit_command(&root, &config, args, event_log.as_ref()),
+        Command::Review(args) => review_command(&root, &config, args, event_log.as_ref()),
+        Command::Impact(args) => impact_command(&root, &config, args, event_log.as_ref()),
+        Command::Feedback(args) => feedback_command(args, event_log.as_ref()),
+        Command::Analyze(args) => analyze_command(&config, &args, event_log.as_ref()),
     }
 }
 
@@ -536,7 +757,13 @@ fn enabled_workspaces(config: &Config) -> impl Iterator<Item = &WorkspaceConfig>
         .filter(|workspace| workspace.enabled)
 }
 
-fn index_command(root: &Path, config: &Config, args: IndexArgs) -> Result<()> {
+fn index_command(
+    root: &Path,
+    config: &Config,
+    args: IndexArgs,
+    event_log: Option<&EventLog>,
+) -> Result<()> {
+    let started = Instant::now();
     let sources = collect_sources(root, config)?;
     let source_hashes = source_hashes(root, &sources)?;
     let manifest_path = root.join(&config.manifest_path);
@@ -548,6 +775,14 @@ fn index_command(root: &Path, config: &Config, args: IndexArgs) -> Result<()> {
         && existing_manifest.sources == source_hashes
         && index_path.exists()
     {
+        emit_command_invocation(
+            event_log,
+            "index",
+            started,
+            &existing_manifest,
+            None,
+            Some(source_hashes.len()),
+        )?;
         println!("index is current: {} sources", source_hashes.len());
         return Ok(());
     }
@@ -608,10 +843,23 @@ fn index_command(root: &Path, config: &Config, args: IndexArgs) -> Result<()> {
     for (kind, count) in by_kind {
         println!("  {kind}: {count}");
     }
-    Ok(())
+    emit_command_invocation(
+        event_log,
+        "index",
+        started,
+        &manifest,
+        None,
+        Some(sources.len()),
+    )
 }
 
-fn search_command(root: &Path, config: &Config, args: SearchArgs) -> Result<()> {
+fn search_command(
+    root: &Path,
+    config: &Config,
+    args: SearchArgs,
+    event_log: Option<&EventLog>,
+) -> Result<()> {
+    let started = Instant::now();
     ensure_index(root, config)?;
     let index = open_index(root, config)?;
     let fields = Fields::from_schema(&index.schema())?;
@@ -633,10 +881,25 @@ fn search_command(root: &Path, config: &Config, args: SearchArgs) -> Result<()> 
         query: args.query,
         results,
     };
+    let manifest = read_manifest(&root.join(&config.manifest_path))?;
+    emit_command_invocation(
+        event_log,
+        "search",
+        started,
+        &manifest,
+        args.workspace,
+        Some(output.results.len()),
+    )?;
     print_output(&output, args.json)
 }
 
-fn route_command(root: &Path, config: &Config, args: RouteArgs) -> Result<()> {
+fn route_command(
+    root: &Path,
+    config: &Config,
+    args: RouteArgs,
+    event_log: Option<&EventLog>,
+) -> Result<()> {
+    let started = Instant::now();
     if !(3..=8).contains(&args.limit) {
         bail!("route --limit must be between 3 and 8");
     }
@@ -689,10 +952,13 @@ fn route_command(root: &Path, config: &Config, args: RouteArgs) -> Result<()> {
     };
     let notes = route_notes(&args, &scopes, &l3_authorities);
 
+    let request_id = event_log.map(|_| new_request_id());
     let output = RouteOutput {
+        request_id: request_id.clone(),
         task: TaskProfile {
             workspace: args.workspace,
             query: args.query,
+            task_id: args.task_id,
             intent: args.intent,
             entities: args.entities,
             environment: args.environment,
@@ -704,6 +970,32 @@ fn route_command(root: &Path, config: &Config, args: RouteArgs) -> Result<()> {
         l3_authorities,
         notes,
     };
+    if let (Some(event_log), Some(request_id)) = (event_log, request_id) {
+        let manifest = read_manifest(&root.join(&config.manifest_path))?;
+        event_log.append(&RouteInvocationEvent {
+            schema_version: 1,
+            event_type: "route_invoked".to_owned(),
+            timestamp_epoch_millis: epoch_millis(),
+            request_id,
+            task_id: output
+                .task
+                .task_id
+                .as_ref()
+                .map(|value| value_fingerprint(value)),
+            workspace: output.task.workspace.clone(),
+            intent_fingerprint: output
+                .task
+                .intent
+                .as_ref()
+                .map(|value| value_fingerprint(value)),
+            risk: output.task.risk.clone(),
+            scopes: output.task.scopes.clone(),
+            duration_millis: elapsed_millis(started),
+            index_fingerprint: manifest_fingerprint(&manifest),
+            l2_context: event_candidates(&output.l2_context),
+            l3_authorities: event_candidates(&output.l3_authorities),
+        })?;
+    }
     print_output(&output, args.json)
 }
 
@@ -753,7 +1045,13 @@ fn route_notes(
     notes
 }
 
-fn audit_command(root: &Path, config: &Config, args: AuditArgs) -> Result<()> {
+fn audit_command(
+    root: &Path,
+    config: &Config,
+    args: AuditArgs,
+    event_log: Option<&EventLog>,
+) -> Result<()> {
+    let started = Instant::now();
     ensure_index(root, config)?;
     let index = open_index(root, config)?;
     let fields = Fields::from_schema(&index.schema())?;
@@ -847,10 +1145,25 @@ fn audit_command(root: &Path, config: &Config, args: AuditArgs) -> Result<()> {
         memory_file_count,
         warnings,
     };
+    let manifest = read_manifest(&root.join(&config.manifest_path))?;
+    emit_command_invocation(
+        event_log,
+        "audit",
+        started,
+        &manifest,
+        None,
+        Some(output.indexed_chunks),
+    )?;
     print_output(&output, args.json)
 }
 
-fn review_command(root: &Path, config: &Config, args: ReviewArgs) -> Result<()> {
+fn review_command(
+    root: &Path,
+    config: &Config,
+    args: ReviewArgs,
+    event_log: Option<&EventLog>,
+) -> Result<()> {
+    let started = Instant::now();
     ensure_index(root, config)?;
     let workspace = require_workspace(config, &args.workspace)?;
     let workspace_root = root.join(&workspace.path);
@@ -925,10 +1238,25 @@ fn review_command(root: &Path, config: &Config, args: ReviewArgs) -> Result<()> 
         promotion_candidates: candidates,
         warnings,
     };
+    let manifest = read_manifest(&root.join(&config.manifest_path))?;
+    emit_command_invocation(
+        event_log,
+        "review",
+        started,
+        &manifest,
+        Some(output.workspace.clone()),
+        Some(output.promotion_candidates.len()),
+    )?;
     print_output(&output, args.json)
 }
 
-fn impact_command(root: &Path, config: &Config, args: ImpactArgs) -> Result<()> {
+fn impact_command(
+    root: &Path,
+    config: &Config,
+    args: ImpactArgs,
+    event_log: Option<&EventLog>,
+) -> Result<()> {
+    let started = Instant::now();
     ensure_index(root, config)?;
     let index = open_index(root, config)?;
     let fields = Fields::from_schema(&index.schema())?;
@@ -951,7 +1279,7 @@ fn impact_command(root: &Path, config: &Config, args: ImpactArgs) -> Result<()> 
         &index,
         &fields,
         &name_terms,
-        &workspace_filter.into_iter().collect::<Vec<_>>(),
+        &workspace_filter.clone().into_iter().collect::<Vec<_>>(),
         &["route".to_owned()],
         &[],
         None,
@@ -974,7 +1302,702 @@ fn impact_command(root: &Path, config: &Config, args: ImpactArgs) -> Result<()> 
         related_navigation,
         notes,
     };
+    let manifest = read_manifest(&root.join(&config.manifest_path))?;
+    emit_command_invocation(
+        event_log,
+        "impact",
+        started,
+        &manifest,
+        workspace_filter,
+        Some(output.affected_chunks.len()),
+    )?;
     print_output(&output, args.json)
+}
+
+fn analyze_command(
+    config: &Config,
+    args: &AnalyzeArgs,
+    event_log: Option<&EventLog>,
+) -> Result<()> {
+    let event_log = event_log.context(
+        "analyze requires the local event log; omit `--no-event-log` and use the event log that contains route and feedback records",
+    )?;
+    if let Some(workspace) = args.workspace.as_deref() {
+        require_workspace(config, workspace)?;
+    }
+    let parsed = parse_event_log(&event_log.path)?;
+    let output = analyze_events(parsed, args.workspace.as_deref());
+    print_output(&output, args.json)
+}
+
+fn parse_event_log(path: &Path) -> Result<ParsedEventLog> {
+    if !path.exists() {
+        return Ok(ParsedEventLog {
+            events: Vec::new(),
+            physical_line_count: 0,
+            concatenated_event_lines: 0,
+            malformed_line_count: 0,
+        });
+    }
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("read event log {}", path.display()))?;
+    let mut events = Vec::new();
+    let mut physical_line_count = 0;
+    let mut concatenated_event_lines = 0;
+    let mut malformed_line_count = 0;
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        physical_line_count += 1;
+        let deserializer =
+            serde_json::Deserializer::from_str(line).into_iter::<serde_json::Value>();
+        let mut parsed_on_line = 0;
+        for value in deserializer {
+            let Ok(value) = value else {
+                malformed_line_count += 1;
+                break;
+            };
+            let event = match parse_logged_event(value) {
+                Ok(Some(event)) => event,
+                Ok(None) => continue,
+                Err(_) => {
+                    malformed_line_count += 1;
+                    continue;
+                }
+            };
+            parsed_on_line += 1;
+            events.push(event);
+        }
+        if parsed_on_line > 1 {
+            concatenated_event_lines += 1;
+        }
+    }
+    Ok(ParsedEventLog {
+        events,
+        physical_line_count,
+        concatenated_event_lines,
+        malformed_line_count,
+    })
+}
+
+fn parse_logged_event(value: serde_json::Value) -> Result<Option<LoggedEvent>> {
+    match value.get("event_type").and_then(serde_json::Value::as_str) {
+        Some("command_invoked") => serde_json::from_value(value)
+            .map(LoggedEvent::CommandInvoked)
+            .map(Some)
+            .context("parse command invocation event"),
+        Some("route_invoked") => serde_json::from_value(value)
+            .map(LoggedEvent::RouteInvoked)
+            .map(Some)
+            .context("parse route invocation event"),
+        Some("route_feedback") => serde_json::from_value(value)
+            .map(LoggedEvent::RouteFeedback)
+            .map(Some)
+            .context("parse route feedback event"),
+        _ => Ok(None),
+    }
+}
+
+fn analyze_events(parsed: ParsedEventLog, workspace_filter: Option<&str>) -> AnalysisOutput {
+    let ParsedEventLog {
+        events,
+        physical_line_count,
+        concatenated_event_lines,
+        malformed_line_count,
+    } = parsed;
+    let event_count = events.len();
+    let all_route_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            LoggedEvent::RouteInvoked(route) => Some(route.request_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let routes = events
+        .iter()
+        .filter_map(|event| match event {
+            LoggedEvent::RouteInvoked(route) => Some(route),
+            _ => None,
+        })
+        .filter(|route| workspace_filter.is_none_or(|workspace| route.workspace == workspace))
+        .collect::<Vec<_>>();
+    let route_ids = routes
+        .iter()
+        .map(|route| route.request_id.as_str())
+        .collect::<HashSet<_>>();
+
+    let (command_invocations, command_duration_millis) =
+        summarize_command_events(&events, workspace_filter);
+    let route_summary = summarize_route_events(&routes);
+    let feedback_summary =
+        summarize_feedback_events(&events, &all_route_ids, &route_ids, &route_summary);
+
+    let routes_without_feedback = routes
+        .len()
+        .saturating_sub(feedback_summary.routes_with_feedback.len());
+    let route_durations = routes
+        .iter()
+        .map(|route| route.duration_millis)
+        .collect::<Vec<_>>();
+    let metrics = AnalysisMetrics {
+        command_invocations,
+        command_duration_millis,
+        route_count: routes.len(),
+        routes_by_workspace: route_summary.routes_by_workspace,
+        routes_by_risk: route_summary.routes_by_risk,
+        routes_with_l2_context: route_summary.routes_with_l2_context,
+        l2_route_coverage_percent: percentage(route_summary.routes_with_l2_context, routes.len()),
+        route_duration_millis: duration_summary(&route_durations),
+        high_risk_route_count: route_summary.high_risk_route_count,
+        high_risk_routes_with_l3: route_summary.high_risk_routes_with_l3,
+        high_risk_l3_coverage_percent: percentage(
+            route_summary.high_risk_routes_with_l3,
+            route_summary.high_risk_route_count,
+        ),
+        l2_candidate_count: route_summary.l2_candidate_count,
+        l3_candidate_count: route_summary.l3_candidate_count,
+        routes_with_feedback: feedback_summary.routes_with_feedback.len(),
+        routes_without_feedback,
+        feedback_route_coverage_percent: percentage(
+            feedback_summary.routes_with_feedback.len(),
+            routes.len(),
+        ),
+        feedback_event_count: feedback_summary.feedback_event_count,
+        feedback_chunk_count: feedback_summary.feedback_chunk_count,
+        judged_candidate_count: feedback_summary.judged_candidate_count,
+        used_candidate_count: feedback_summary.used_candidate_count,
+        used_candidate_rate_among_judged_percent: percentage(
+            feedback_summary.used_candidate_count,
+            feedback_summary.judged_candidate_count,
+        ),
+        feedback_outcomes: feedback_summary.feedback_outcomes,
+        used_candidates_by_kind: feedback_summary.used_candidates_by_kind,
+        orphan_feedback_count: feedback_summary.orphan_feedback_count,
+    };
+    AnalysisOutput {
+        data_quality: AnalysisDataQuality {
+            event_count,
+            physical_line_count,
+            concatenated_event_lines,
+            malformed_line_count,
+        },
+        conclusion: effectiveness_conclusion(&metrics, workspace_filter, malformed_line_count),
+        metrics,
+    }
+}
+
+fn summarize_command_events(
+    events: &[LoggedEvent],
+    workspace_filter: Option<&str>,
+) -> (BTreeMap<String, usize>, BTreeMap<String, DurationSummary>) {
+    let mut command_invocations = BTreeMap::new();
+    let mut command_durations = BTreeMap::<String, Vec<u64>>::new();
+    for command in events.iter().filter_map(|event| match event {
+        LoggedEvent::CommandInvoked(command)
+            if workspace_filter
+                .is_none_or(|workspace| command.workspace.as_deref() == Some(workspace)) =>
+        {
+            Some(command)
+        }
+        _ => None,
+    }) {
+        *command_invocations
+            .entry(command.command.clone())
+            .or_default() += 1;
+        command_durations
+            .entry(command.command.clone())
+            .or_default()
+            .push(command.duration_millis);
+    }
+    let command_duration_millis = command_durations
+        .into_iter()
+        .map(|(command, durations)| {
+            let sum = durations.iter().sum::<u64>();
+            let count = durations.len();
+            (
+                command,
+                DurationSummary {
+                    count,
+                    min: *durations.iter().min().unwrap_or(&0),
+                    max: *durations.iter().max().unwrap_or(&0),
+                    average: round_percent(as_f64(sum) / as_f64(count)),
+                },
+            )
+        })
+        .collect();
+    (command_invocations, command_duration_millis)
+}
+
+#[derive(Default)]
+struct RouteSummary {
+    routes_by_workspace: BTreeMap<String, usize>,
+    routes_by_risk: BTreeMap<String, usize>,
+    candidate_kinds: BTreeMap<(String, String), String>,
+    routes_with_l2_context: usize,
+    high_risk_route_count: usize,
+    high_risk_routes_with_l3: usize,
+    l2_candidate_count: usize,
+    l3_candidate_count: usize,
+}
+
+fn summarize_route_events(routes: &[&RouteInvocationEvent]) -> RouteSummary {
+    let mut summary = RouteSummary::default();
+    for route in routes {
+        *summary
+            .routes_by_workspace
+            .entry(route.workspace.clone())
+            .or_default() += 1;
+        *summary
+            .routes_by_risk
+            .entry(route.risk.clone())
+            .or_default() += 1;
+        if !route.l2_context.is_empty() {
+            summary.routes_with_l2_context += 1;
+        }
+        if route.risk == "high" {
+            summary.high_risk_route_count += 1;
+            if !route.l3_authorities.is_empty() {
+                summary.high_risk_routes_with_l3 += 1;
+            }
+        }
+        summary.l2_candidate_count += route.l2_context.len();
+        summary.l3_candidate_count += route.l3_authorities.len();
+        for candidate in route.l2_context.iter().chain(&route.l3_authorities) {
+            summary.candidate_kinds.insert(
+                (route.request_id.clone(), candidate.chunk_id.clone()),
+                candidate.kind.clone(),
+            );
+        }
+    }
+    summary
+}
+
+#[derive(Default)]
+struct FeedbackSummary {
+    routes_with_feedback: HashSet<String>,
+    feedback_outcomes: BTreeMap<String, usize>,
+    used_candidates_by_kind: BTreeMap<String, usize>,
+    feedback_event_count: usize,
+    feedback_chunk_count: usize,
+    judged_candidate_count: usize,
+    used_candidate_count: usize,
+    orphan_feedback_count: usize,
+}
+
+fn summarize_feedback_events(
+    events: &[LoggedEvent],
+    all_route_ids: &HashSet<&str>,
+    route_ids: &HashSet<&str>,
+    route_summary: &RouteSummary,
+) -> FeedbackSummary {
+    let mut summary = FeedbackSummary::default();
+    let mut candidate_outcomes: BTreeMap<(String, String), FeedbackOutcome> = BTreeMap::new();
+    for feedback in events.iter().filter_map(|event| match event {
+        LoggedEvent::RouteFeedback(feedback) => Some(feedback),
+        _ => None,
+    }) {
+        if !all_route_ids.contains(feedback.request_id.as_str()) {
+            summary.orphan_feedback_count += feedback.chunk_ids.len();
+            continue;
+        }
+        if !route_ids.contains(feedback.request_id.as_str()) {
+            continue;
+        }
+        summary
+            .routes_with_feedback
+            .insert(feedback.request_id.clone());
+        summary.feedback_event_count += 1;
+        *summary
+            .feedback_outcomes
+            .entry(feedback.outcome.as_str().to_owned())
+            .or_default() += 1;
+        summary.feedback_chunk_count += feedback.chunk_ids.len();
+        for chunk_id in &feedback.chunk_ids {
+            if route_summary
+                .candidate_kinds
+                .contains_key(&(feedback.request_id.clone(), chunk_id.clone()))
+            {
+                candidate_outcomes.insert(
+                    (feedback.request_id.clone(), chunk_id.clone()),
+                    feedback.outcome,
+                );
+            } else {
+                summary.orphan_feedback_count += 1;
+            }
+        }
+    }
+    for ((request_id, chunk_id), outcome) in &candidate_outcomes {
+        if *outcome == FeedbackOutcome::Used
+            && let Some(kind) = route_summary
+                .candidate_kinds
+                .get(&(request_id.clone(), chunk_id.clone()))
+        {
+            *summary
+                .used_candidates_by_kind
+                .entry(kind.clone())
+                .or_default() += 1;
+            summary.used_candidate_count += 1;
+        }
+    }
+    summary.judged_candidate_count = candidate_outcomes.len();
+    summary
+}
+
+fn effectiveness_conclusion(
+    metrics: &AnalysisMetrics,
+    workspace_filter: Option<&str>,
+    malformed_line_count: usize,
+) -> EffectivenessConclusion {
+    let scope = workspace_filter.map_or_else(
+        || "collection".to_owned(),
+        |workspace| format!("workspace `{workspace}`"),
+    );
+    if metrics.route_count == 0 {
+        return EffectivenessConclusion {
+            status: "insufficient_data".to_owned(),
+            confidence: "none".to_owned(),
+            findings: vec![format!("No route events are available for the selected {scope}.")],
+            recommendations: vec![
+                "Run route with local event logging enabled, then record feedback after judging candidates."
+                    .to_owned(),
+            ],
+        };
+    }
+
+    let coverage = metrics.feedback_route_coverage_percent.unwrap_or_default();
+    let mut findings = vec![format!(
+        "{} of {} route request(s) have feedback coverage ({coverage:.1}%).",
+        metrics.routes_with_feedback, metrics.route_count
+    )];
+    let mut recommendations = Vec::new();
+    if metrics.high_risk_route_count > 0 {
+        findings.push(format!(
+            "{} of {} high-risk route request(s) returned L3 authority candidates.",
+            metrics.high_risk_routes_with_l3, metrics.high_risk_route_count
+        ));
+    }
+    if malformed_line_count > 0 {
+        findings.push(format!(
+            "{malformed_line_count} event-log record(s) were malformed and excluded from metrics."
+        ));
+        recommendations.push(
+            "Repair or rotate the local event log before using the result for a longitudinal decision."
+                .to_owned(),
+        );
+    }
+    if metrics.orphan_feedback_count > 0 {
+        findings.push(format!(
+            "{} feedback chunk reference(s) could not be matched to the selected route events.",
+            metrics.orphan_feedback_count
+        ));
+        recommendations.push(
+            "Use the request_id and chunk_id emitted by the same route invocation for feedback."
+                .to_owned(),
+        );
+    }
+    if metrics.judged_candidate_count == 0 {
+        recommendations.push(
+            "Record used, background, rejected, or needs-l3 outcomes for every candidate actually judged."
+                .to_owned(),
+        );
+    } else if !metrics.feedback_outcomes.contains_key("background")
+        && !metrics.feedback_outcomes.contains_key("rejected")
+        && !metrics.feedback_outcomes.contains_key("needs_l3")
+    {
+        recommendations.push(
+            "Record background, rejected, and needs-l3 outcomes when applicable; used-only feedback cannot measure ranking precision."
+                .to_owned(),
+        );
+    }
+    if metrics.routes_without_feedback > 0 {
+        recommendations.push(
+            "Close feedback for route requests whose candidates were actually judged.".to_owned(),
+        );
+    }
+    if metrics.l2_candidate_count == 0 {
+        recommendations.push(
+            "If L2 context remains empty for recurring work, promote confirmed and traceable task conclusions into memory."
+                .to_owned(),
+        );
+    }
+
+    let confidence = if metrics.judged_candidate_count >= 30 && coverage >= 80.0 {
+        "high"
+    } else if metrics.judged_candidate_count >= 10 && coverage >= 50.0 {
+        "medium"
+    } else {
+        "low"
+    };
+    let has_discriminating_feedback = metrics.feedback_outcomes.contains_key("background")
+        || metrics.feedback_outcomes.contains_key("rejected")
+        || metrics.feedback_outcomes.contains_key("needs_l3");
+    let status = if malformed_line_count > 0
+        || metrics.orphan_feedback_count > 0
+        || coverage < 50.0
+        || (metrics.high_risk_route_count > metrics.high_risk_routes_with_l3)
+    {
+        "needs_attention"
+    } else if confidence == "low" {
+        "early_signal"
+    } else if !has_discriminating_feedback {
+        "insufficient_discrimination"
+    } else {
+        "effective"
+    };
+    EffectivenessConclusion {
+        status: status.to_owned(),
+        confidence: confidence.to_owned(),
+        findings,
+        recommendations,
+    }
+}
+
+fn duration_summary(durations: &[u64]) -> Option<DurationSummary> {
+    (!durations.is_empty()).then(|| DurationSummary {
+        count: durations.len(),
+        min: *durations.iter().min().unwrap_or(&0),
+        max: *durations.iter().max().unwrap_or(&0),
+        average: round_percent(as_f64(durations.iter().sum::<u64>()) / as_f64(durations.len())),
+    })
+}
+
+fn percentage(numerator: usize, denominator: usize) -> Option<f64> {
+    (denominator != 0).then(|| round_percent(as_f64(numerator) * 100.0 / as_f64(denominator)))
+}
+
+fn as_f64(value: impl IntoF64) -> f64 {
+    value.into_f64()
+}
+
+trait IntoF64 {
+    fn into_f64(self) -> f64;
+}
+
+impl IntoF64 for usize {
+    fn into_f64(self) -> f64 {
+        // usize is at most 64 bits; on 64-bit platforms this may exceed f64 precision,
+        // but memory event counts stay well below 2^53.
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self as f64
+        }
+    }
+}
+
+impl IntoF64 for u64 {
+    fn into_f64(self) -> f64 {
+        // u64 may exceed f64 precision, but route durations and counts stay below 2^53.
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self as f64
+        }
+    }
+}
+
+fn round_percent(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+fn feedback_command(args: FeedbackArgs, event_log: Option<&EventLog>) -> Result<()> {
+    let event_log = event_log.context(
+        "feedback requires the local event log; omit `--no-event-log` and use the same `--event-log` path as route",
+    )?;
+    let route_event = event_log.route_event(&args.request_id)?;
+    let accepted_chunk_ids = validate_feedback_chunks(&route_event, args.outcome, args.chunk_ids)?;
+    event_log.append(&FeedbackEvent {
+        schema_version: 1,
+        event_type: "route_feedback".to_owned(),
+        timestamp_epoch_millis: epoch_millis(),
+        request_id: args.request_id.clone(),
+        outcome: args.outcome,
+        chunk_ids: accepted_chunk_ids.clone(),
+    })?;
+    let output = FeedbackOutput {
+        request_id: args.request_id,
+        outcome: args.outcome,
+        accepted_chunk_ids,
+    };
+    print_output(&output, args.json)
+}
+
+fn validate_feedback_chunks(
+    route_event: &RouteInvocationEvent,
+    outcome: FeedbackOutcome,
+    mut chunk_ids: Vec<String>,
+) -> Result<Vec<String>> {
+    if outcome.requires_chunks() && chunk_ids.is_empty() {
+        bail!("feedback outcome requires at least one --chunk-id");
+    }
+    if !outcome.requires_chunks() && !chunk_ids.is_empty() {
+        bail!("blocked feedback must not include --chunk-id");
+    }
+
+    let routed_chunk_ids = route_event
+        .l2_context
+        .iter()
+        .chain(&route_event.l3_authorities)
+        .map(|candidate| candidate.chunk_id.as_str())
+        .collect::<HashSet<_>>();
+    let invalid_chunk_ids = chunk_ids
+        .iter()
+        .filter(|chunk_id| !routed_chunk_ids.contains(chunk_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !invalid_chunk_ids.is_empty() {
+        bail!(
+            "feedback chunk IDs were not returned by route request `{}`: {}",
+            route_event.request_id,
+            invalid_chunk_ids.join(", ")
+        );
+    }
+
+    chunk_ids.sort();
+    chunk_ids.dedup();
+    Ok(chunk_ids)
+}
+
+fn event_log_for_cli(root: &Path, cli: &Cli) -> Option<EventLog> {
+    if cli.no_event_log {
+        return None;
+    }
+    let requested_path = cli
+        .event_log
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(EVENT_LOG_PATH));
+    let path = if requested_path.is_absolute() {
+        requested_path
+    } else {
+        root.join(requested_path)
+    };
+    Some(EventLog { path })
+}
+
+impl EventLog {
+    fn append<T: Serialize>(&self, event: &T) -> Result<()> {
+        let parent = self.path.parent().context("event log must have a parent")?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("open event log {}", self.path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("lock event log {}", self.path.display()))?;
+        let result = (|| {
+            let event = serde_json::to_string(event)?;
+            writeln!(file, "{event}")
+                .with_context(|| format!("write event log {}", self.path.display()))?;
+            file.sync_data()
+                .with_context(|| format!("sync event log {}", self.path.display()))
+        })();
+        let unlock_result = FileExt::unlock(&file)
+            .with_context(|| format!("unlock event log {}", self.path.display()));
+        result?;
+        unlock_result
+    }
+
+    fn route_event(&self, request_id: &str) -> Result<RouteInvocationEvent> {
+        let raw = fs::read_to_string(&self.path)
+            .with_context(|| format!("read event log {}", self.path.display()))?;
+        for line in raw.lines().rev().filter(|line| !line.trim().is_empty()) {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .with_context(|| format!("parse event log {}", self.path.display()))?;
+            if value.get("event_type").and_then(serde_json::Value::as_str) == Some("route_invoked")
+                && value.get("request_id").and_then(serde_json::Value::as_str) == Some(request_id)
+            {
+                return serde_json::from_value(value).context("parse route invocation event");
+            }
+        }
+        bail!(
+            "route request `{request_id}` was not found in {}",
+            self.path.display()
+        )
+    }
+}
+
+fn emit_command_invocation(
+    event_log: Option<&EventLog>,
+    command: &str,
+    started: Instant,
+    manifest: &Manifest,
+    workspace: Option<String>,
+    result_count: Option<usize>,
+) -> Result<()> {
+    if let Some(event_log) = event_log {
+        event_log.append(&CommandInvocationEvent {
+            schema_version: 1,
+            event_type: "command_invoked".to_owned(),
+            timestamp_epoch_millis: epoch_millis(),
+            command: command.to_owned(),
+            duration_millis: elapsed_millis(started),
+            index_fingerprint: manifest_fingerprint(manifest),
+            workspace,
+            result_count,
+        })?;
+    }
+    Ok(())
+}
+
+fn event_candidates(results: &[SearchResult]) -> Vec<EventCandidate> {
+    results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| EventCandidate {
+            chunk_id: result.chunk_id.clone(),
+            rank: index + 1,
+            kind: result.kind.clone(),
+        })
+        .collect()
+}
+
+fn chunk_id_for_parts(
+    workspace: &str,
+    path: &str,
+    kind: &str,
+    line_start: u64,
+    line_end: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(workspace);
+    hasher.update([0]);
+    hasher.update(path);
+    hasher.update([0]);
+    hasher.update(kind);
+    hasher.update([0]);
+    hasher.update(line_start.to_le_bytes());
+    hasher.update(line_end.to_le_bytes());
+    format!("chunk_{:x}", hasher.finalize())
+}
+
+fn new_request_id() -> String {
+    let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(epoch_millis().to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    format!("route_{:x}", hasher.finalize())
+}
+
+fn value_fingerprint(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn manifest_fingerprint(manifest: &Manifest) -> String {
+    let encoded = serde_json::to_vec(manifest).unwrap_or_default();
+    value_fingerprint(&String::from_utf8_lossy(&encoded))
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn print_output<T: Serialize>(value: &T, json: bool) -> Result<()> {
@@ -1539,9 +2562,12 @@ fn build_index(index_path: &Path, chunks: &[Chunk]) -> Result<()> {
     register_tokenizers(&index);
     let mut writer = index.writer(50_000_000)?;
     for chunk in chunks {
-        let id = format!(
-            "{}:{}#{}:{}-{}",
-            chunk.workspace, chunk.path, chunk.kind, chunk.line_start, chunk.line_end
+        let id = chunk_id_for_parts(
+            &chunk.workspace,
+            &chunk.path,
+            &chunk.kind,
+            chunk.line_start,
+            chunk.line_end,
         );
         let mut document = TantivyDocument::default();
         document.add_text(fields.id, id);
@@ -1795,6 +2821,7 @@ fn document_to_result(
     document: &TantivyDocument,
     fields: &Fields,
 ) -> Result<SearchResult> {
+    let chunk_id = first_text(document, fields.id)?;
     let workspace = first_text(document, fields.workspace)?;
     let kind = first_text(document, fields.kind)?;
     let path = first_text(document, fields.path)?;
@@ -1805,6 +2832,7 @@ fn document_to_result(
     let body = first_text(document, fields.body)?;
     Ok(SearchResult {
         score,
+        chunk_id,
         workspace,
         kind,
         path,
@@ -2214,10 +3242,279 @@ mod tests {
     }
 
     #[test]
+    fn event_log_append_serializes_concurrent_writers_as_jsonl() {
+        let temp = TempDir::new().unwrap();
+        let event_log = EventLog {
+            path: temp.path().join("events.jsonl"),
+        };
+        let workers = (0..16)
+            .map(|index| {
+                let event_log = event_log.clone();
+                std::thread::spawn(move || {
+                    event_log
+                        .append(&CommandInvocationEvent {
+                            schema_version: 1,
+                            event_type: "command_invoked".to_owned(),
+                            timestamp_epoch_millis: index,
+                            command: "index".to_owned(),
+                            duration_millis: 0,
+                            index_fingerprint: "sha256:test".to_owned(),
+                            workspace: None,
+                            result_count: None,
+                        })
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let contents = fs::read_to_string(&event_log.path).unwrap();
+        let events = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 16);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["event_type"] == "command_invoked")
+        );
+    }
+
+    #[test]
+    fn event_log_selection_defaults_to_memroute_and_honors_opt_out() {
+        let root = Path::new("/collection");
+        let mut cli = Cli {
+            root: None,
+            event_log: None,
+            no_event_log: false,
+            command: Command::Index(IndexArgs { force: false }),
+        };
+
+        assert_eq!(
+            event_log_for_cli(root, &cli).unwrap().path,
+            root.join(EVENT_LOG_PATH)
+        );
+
+        cli.event_log = Some(PathBuf::from("local/usage.jsonl"));
+        assert_eq!(
+            event_log_for_cli(root, &cli).unwrap().path,
+            root.join("local/usage.jsonl")
+        );
+
+        cli.no_event_log = true;
+        assert!(event_log_for_cli(root, &cli).is_none());
+    }
+
+    #[test]
+    fn feedback_validation_accepts_returned_chunks_and_deduplicates() {
+        let route_event = RouteInvocationEvent {
+            schema_version: 1,
+            event_type: "route_invoked".to_owned(),
+            timestamp_epoch_millis: 1,
+            request_id: "route_test".to_owned(),
+            task_id: None,
+            workspace: "demo".to_owned(),
+            intent_fingerprint: None,
+            risk: "normal".to_owned(),
+            scopes: vec!["demo".to_owned()],
+            duration_millis: 1,
+            index_fingerprint: "sha256:index".to_owned(),
+            l2_context: vec![EventCandidate {
+                chunk_id: "chunk_l2".to_owned(),
+                rank: 1,
+                kind: "stable_fact".to_owned(),
+            }],
+            l3_authorities: vec![EventCandidate {
+                chunk_id: "chunk_l3".to_owned(),
+                rank: 1,
+                kind: "external_authority".to_owned(),
+            }],
+        };
+        let accepted = validate_feedback_chunks(
+            &route_event,
+            FeedbackOutcome::Used,
+            vec![
+                "chunk_l3".to_owned(),
+                "chunk_l2".to_owned(),
+                "chunk_l2".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(accepted, vec!["chunk_l2", "chunk_l3"]);
+    }
+
+    #[test]
+    fn feedback_validation_rejects_unknown_or_invalid_chunk_sets() {
+        let route_event = RouteInvocationEvent {
+            schema_version: 1,
+            event_type: "route_invoked".to_owned(),
+            timestamp_epoch_millis: 1,
+            request_id: "route_test".to_owned(),
+            task_id: None,
+            workspace: "demo".to_owned(),
+            intent_fingerprint: None,
+            risk: "normal".to_owned(),
+            scopes: vec!["demo".to_owned()],
+            duration_millis: 1,
+            index_fingerprint: "sha256:index".to_owned(),
+            l2_context: vec![EventCandidate {
+                chunk_id: "chunk_l2".to_owned(),
+                rank: 1,
+                kind: "stable_fact".to_owned(),
+            }],
+            l3_authorities: Vec::new(),
+        };
+        assert!(
+            validate_feedback_chunks(
+                &route_event,
+                FeedbackOutcome::Used,
+                vec!["unknown_chunk".to_owned()],
+            )
+            .is_err()
+        );
+        assert!(validate_feedback_chunks(&route_event, FeedbackOutcome::Used, Vec::new()).is_err());
+        assert!(
+            validate_feedback_chunks(
+                &route_event,
+                FeedbackOutcome::Blocked,
+                vec!["chunk_l2".to_owned()],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn analysis_reports_metrics_and_effectiveness_for_workspace() {
+        let parsed = ParsedEventLog {
+            physical_line_count: 4,
+            concatenated_event_lines: 0,
+            malformed_line_count: 0,
+            events: vec![
+                LoggedEvent::CommandInvoked(CommandInvocationEvent {
+                    schema_version: 1,
+                    event_type: "command_invoked".to_owned(),
+                    timestamp_epoch_millis: 1,
+                    command: "route".to_owned(),
+                    duration_millis: 25,
+                    index_fingerprint: "sha256:index".to_owned(),
+                    workspace: Some("demo".to_owned()),
+                    result_count: Some(2),
+                }),
+                LoggedEvent::RouteInvoked(RouteInvocationEvent {
+                    schema_version: 1,
+                    event_type: "route_invoked".to_owned(),
+                    timestamp_epoch_millis: 2,
+                    request_id: "route_demo".to_owned(),
+                    task_id: None,
+                    workspace: "demo".to_owned(),
+                    intent_fingerprint: None,
+                    risk: "high".to_owned(),
+                    scopes: vec!["demo".to_owned()],
+                    duration_millis: 20,
+                    index_fingerprint: "sha256:index".to_owned(),
+                    l2_context: vec![EventCandidate {
+                        chunk_id: "chunk_l2".to_owned(),
+                        rank: 1,
+                        kind: "stable_fact".to_owned(),
+                    }],
+                    l3_authorities: vec![EventCandidate {
+                        chunk_id: "chunk_l3".to_owned(),
+                        rank: 1,
+                        kind: "external_authority".to_owned(),
+                    }],
+                }),
+                LoggedEvent::RouteFeedback(FeedbackEvent {
+                    schema_version: 1,
+                    event_type: "route_feedback".to_owned(),
+                    timestamp_epoch_millis: 3,
+                    request_id: "route_demo".to_owned(),
+                    outcome: FeedbackOutcome::Used,
+                    chunk_ids: vec!["chunk_l2".to_owned()],
+                }),
+                LoggedEvent::RouteFeedback(FeedbackEvent {
+                    schema_version: 1,
+                    event_type: "route_feedback".to_owned(),
+                    timestamp_epoch_millis: 4,
+                    request_id: "route_demo".to_owned(),
+                    outcome: FeedbackOutcome::Rejected,
+                    chunk_ids: vec!["chunk_l3".to_owned()],
+                }),
+            ],
+        };
+
+        let output = analyze_events(parsed, Some("demo"));
+        assert_eq!(output.metrics.route_count, 1);
+        assert_eq!(output.metrics.routes_with_feedback, 1);
+        assert_eq!(output.metrics.feedback_route_coverage_percent, Some(100.0));
+        assert_eq!(output.metrics.judged_candidate_count, 2);
+        assert_eq!(output.metrics.used_candidate_count, 1);
+        assert_eq!(
+            output.metrics.used_candidate_rate_among_judged_percent,
+            Some(50.0)
+        );
+        assert_eq!(output.metrics.high_risk_routes_with_l3, 1);
+        assert_eq!(output.metrics.used_candidates_by_kind["stable_fact"], 1);
+        assert_eq!(output.conclusion.status, "early_signal");
+    }
+
+    #[test]
+    fn event_log_parser_tolerates_concatenated_and_malformed_records() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("events.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"schema_version":1,"event_type":"command_invoked","timestamp_epoch_millis":1,"command":"index","duration_millis":1,"index_fingerprint":"sha256:index"}"#,
+                r#"{"schema_version":1,"event_type":"route_feedback","timestamp_epoch_millis":2,"request_id":"route_demo","outcome":"blocked","chunk_ids":[]}"#,
+                "\n{not-json}\n"
+            ),
+        )
+        .unwrap();
+
+        let parsed = parse_event_log(&path).unwrap();
+        assert_eq!(parsed.events.len(), 2);
+        assert_eq!(parsed.physical_line_count, 2);
+        assert_eq!(parsed.concatenated_event_lines, 1);
+        assert_eq!(parsed.malformed_line_count, 1);
+    }
+
+    #[test]
+    fn route_event_candidates_do_not_include_source_content() {
+        let results = vec![SearchResult {
+            score: 1.0,
+            chunk_id: "chunk_test".to_owned(),
+            workspace: "demo".to_owned(),
+            kind: "stable_fact".to_owned(),
+            path: "memory/private.md".to_owned(),
+            heading_path: "Sensitive heading".to_owned(),
+            line_start: 1,
+            line_end: 2,
+            title: "Sensitive title".to_owned(),
+            entities: vec!["secret-entity".to_owned()],
+            environment: vec!["production".to_owned()],
+            lifecycle: Vec::new(),
+            source_urls: vec!["https://private.example".to_owned()],
+            verified_at: None,
+            canonical_ref: None,
+            excerpt: "sensitive source text".to_owned(),
+        }];
+        let candidates = event_candidates(&results);
+        let serialized = serde_json::to_string(&candidates).unwrap();
+        assert_eq!(candidates[0].chunk_id, "chunk_test");
+        assert!(!serialized.contains("private.md"));
+        assert!(!serialized.contains("sensitive source text"));
+        assert!(!serialized.contains("secret-entity"));
+    }
+
+    #[test]
     fn route_ranking_prefers_navigated_stable_knowledge() {
         let candidates = vec![
             SearchResult {
                 score: 100.0,
+                chunk_id: "chunk_demo_task".to_owned(),
                 workspace: "demo".to_owned(),
                 kind: "task_experience".to_owned(),
                 path: "tasks/a/task.md".to_owned(),
@@ -2235,6 +3532,7 @@ mod tests {
             },
             SearchResult {
                 score: 30.0,
+                chunk_id: "chunk_demo_fact".to_owned(),
                 workspace: "demo".to_owned(),
                 kind: "stable_fact".to_owned(),
                 path: "memory/topic.md".to_owned(),

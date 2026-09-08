@@ -15,7 +15,10 @@ This repository contains the portable `memroute` CLI and the `agent-workspace-in
 
 - Keep the CLI portable: accept collection locations through `--root`; when omitted, use the process working directory. Never add a machine-specific default path.
 - Treat a collection's `memroute.toml`, `AGENTS.md`, `memory/`, and `tasks/` as user-owned input. Do not add real collection data to this repository.
-- Keep indexing local and rebuildable. `.memroute/` is derived data and must stay untracked.
+- Keep indexing local and rebuildable. `.memroute/`, including the default `.memroute/events.jsonl` event log, is derived data and must stay untracked.
+- Event logging is local and opt-out: commands write to `.memroute/events.jsonl` by default; `--event-log <path>` selects another local JSONL path and `--no-event-log` disables logging. A feedback command must use the same event log that produced the route `request_id`.
+- Event records may contain only command names, duration, index fingerprint, workspace/scope, risk, opaque request/chunk IDs, candidate ranks/kinds and hashed opaque task/intent IDs. They must never contain query text, entities, environment values, paths, headings, titles, excerpts, URLs, source bodies, credentials, personal data, private hostnames, internal URLs, or full sensitive request payloads.
+- `feedback` is append-only caller input: validate each `chunk_id` against the route request before recording `used`, `background`, `rejected` or `needs-l3`; use `blocked` with no chunk ID when execution is stopped for missing authority or another safety boundary.
 - Never add passwords, tokens, cookies, private keys, personal data, private hostnames, internal URLs, or full sensitive request payloads.
 - Prefer generic examples such as `example.com`, `<collection-root>`, and `<memroute-repository>`.
 - Preserve the L0--L3 workflow: routing output is evidence selection, not a replacement for reading source sections or verifying L3 authorities.
@@ -30,10 +33,10 @@ This repository contains the portable `memroute` CLI and the `agent-workspace-in
 
 ## Skill Maintenance
 
-The skill must remain self-contained and portable. Its command examples must invoke the checked-out CLI through:
+The skill must remain self-contained and portable. Its day-to-day command examples must prefer an installed `memroute` binary on `PATH`; document the local event-log and `feedback` contract without embedding organization-specific paths, identifiers or event data:
 
 ```bash
-cargo run --manifest-path <memroute-repository>/Cargo.toml -- --root <collection-root> index
+memroute --root <collection-root> index
 ```
 
-When users run the command from `<collection-root>`, `--root <collection-root>` may be omitted. Keep the skill's governance guidance aligned with the CLI command names and output contract.
+Use `cargo run --manifest-path <memroute-repository>/Cargo.toml -- --root <collection-root> <command>` only for first installation or binary upgrades, and for developing, debugging, or validating source that is not installed. After source validation, use `cargo install --path <memroute-repository> --force` to update the `PATH` binary. When users run the command from `<collection-root>`, `--root <collection-root>` may be omitted. Keep the skill's governance guidance aligned with the CLI command names, event schema and feedback contract.
