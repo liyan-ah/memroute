@@ -422,6 +422,9 @@ struct Fields {
     line_end: Field,
     title: Field,
     body: Field,
+    title_cjk: Field,
+    body_cjk: Field,
+    heading_path_cjk: Field,
     entities: Field,
     environment: Field,
     lifecycle: Field,
@@ -466,6 +469,24 @@ impl Fields {
         let line_end = builder.add_u64_field("line_end", FAST | STORED | INDEXED);
         let title = builder.add_text_field("title", mixed(true));
         let body = builder.add_text_field("body", mixed(true));
+        // CJK 检索副本字段：SimpleTokenizer 会把连续中文切成单个整 token，
+        // 导致「显卡驱动」无法命中「重启后显卡驱动不正常」。这里用 2-4 字符
+        // n-gram 单独索引中文文本，查询时与 above 字段做 OR，英文精度不受影响。
+        let cjk = |stored: bool| {
+            let options = TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("cjk_ngram")
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            );
+            if stored {
+                options.set_stored()
+            } else {
+                options
+            }
+        };
+        let title_cjk = builder.add_text_field("title_cjk", cjk(false));
+        let body_cjk = builder.add_text_field("body_cjk", cjk(false));
+        let heading_path_cjk = builder.add_text_field("heading_path_cjk", cjk(false));
         let entities = builder.add_text_field("entities", code(true));
         let environment = builder.add_text_field("environment", code(true));
         let lifecycle = builder.add_text_field("lifecycle", mixed(true));
@@ -485,6 +506,9 @@ impl Fields {
                 line_end,
                 title,
                 body,
+                title_cjk,
+                body_cjk,
+                heading_path_cjk,
                 entities,
                 environment,
                 lifecycle,
@@ -511,6 +535,9 @@ impl Fields {
             line_end: get("line_end")?,
             title: get("title")?,
             body: get("body")?,
+            title_cjk: get("title_cjk")?,
+            body_cjk: get("body_cjk")?,
+            heading_path_cjk: get("heading_path_cjk")?,
             entities: get("entities")?,
             environment: get("environment")?,
             lifecycle: get("lifecycle")?,
@@ -2579,6 +2606,9 @@ fn build_index(index_path: &Path, chunks: &[Chunk]) -> Result<()> {
         document.add_u64(fields.line_end, chunk.line_end);
         document.add_text(fields.title, &chunk.title);
         document.add_text(fields.body, &chunk.body);
+        document.add_text(fields.title_cjk, &chunk.title);
+        document.add_text(fields.body_cjk, &chunk.body);
+        document.add_text(fields.heading_path_cjk, &chunk.heading_path);
         for entity in &chunk.entities {
             document.add_text(fields.entities, entity);
         }
@@ -2710,6 +2740,29 @@ fn build_query(
         if let Ok(query) = parser.parse_query(&term) {
             should_clauses.push((Occur::Should, Box::new(query)));
         }
+        // 含 CJK 的词额外查询 n-gram 副本字段。
+        // SimpleTokenizer 把连续中文当作单个 token，无法做子串匹配；
+        // n-gram 字段则把「显卡驱动」拆成「显卡」「卡驱」「驱动」等 2-4 字片段，
+        // 从而能命中「重启后显卡驱动不正常」。纯 ASCII 词不加此子句，避免拖低精度。
+        if term.chars().any(is_cjk) {
+            let grams = cjk_ngrams(&term, 2, 4);
+            if !grams.is_empty() {
+                let mut gram_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+                for gram in &grams {
+                    for field in [fields.title_cjk, fields.body_cjk, fields.heading_path_cjk] {
+                        gram_clauses.push((
+                            Occur::Should,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(field, gram),
+                                IndexRecordOption::WithFreqs,
+                            )),
+                        ));
+                    }
+                }
+                // 任一 n-gram 命中即可（Should 在 BooleanQuery 中默认可满足其一）
+                should_clauses.push((Occur::Should, Box::new(BooleanQuery::from(gram_clauses))));
+            }
+        }
     }
     for entity in entities {
         should_clauses.push((
@@ -2787,6 +2840,36 @@ fn query_terms(query: &str) -> Vec<String> {
         terms.push(sanitized);
     }
     terms
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(character as u32,
+        0x3400..=0x4DBF      // CJK 扩展 A
+        | 0x4E00..=0x9FFF    // CJK 基本区
+        | 0xF900..=0xFAFF    // CJK 兼容
+        | 0x3040..=0x30FF    // 日文假名
+        | 0xAC00..=0xD7AF    // 韩文音节
+        | 0x20000..=0x2FA1F  // CJK 扩展 B-F
+    )
+}
+
+/// 生成 min..=max 字符长度的 n-gram，用于匹配 `cjk_ngram` 分词器建的中文索引。
+/// 与 Tantivy `NgramTokenizer::new(min, max, false)` 的行为保持一致：
+/// 只切完整字符边界，不做前缀填充。
+fn cjk_ngrams(text: &str, min: usize, max: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut grams = Vec::new();
+    for size in min..=max {
+        if size == 0 || size > chars.len() {
+            continue;
+        }
+        for window in chars.windows(size) {
+            grams.push(window.iter().collect::<String>());
+        }
+    }
+    grams.sort();
+    grams.dedup();
+    grams
 }
 
 fn sanitize_query(query: &str) -> String {
